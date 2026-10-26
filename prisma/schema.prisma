@@ -1,0 +1,22 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  recursive_type_depth = 5
+}
+
+model TradeDecision {
+  id             String   @id @default(uuid())
+  asset          String
+  timeframe      String
+  action         String
+  confidence     Int
+  reasoning      String   @db.Text
+  market_context Json
+  created_at     DateTime @default(now())
+
+  @@map("TradeDecision")
+}
