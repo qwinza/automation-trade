@@ -1,4 +1,4 @@
-"""Unit tests for Fundamental Agent ('The Economist') integration with Gemini API and The Judge."""
+"""Unit tests for Fundamental Agent ('The Economist') integration with 9Router OpenAI Gateway and The Judge."""
 
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,8 +13,19 @@ from src.main import format_market_data
 from src.models.payload import TradingViewPayload
 
 
+def _make_mock_completion(content: str):
+    """Helper to mock OpenAI ChatCompletion response."""
+    message = MagicMock()
+    message.content = content
+    choice = MagicMock()
+    choice.message = message
+    resp = MagicMock()
+    resp.choices = [choice]
+    return resp
+
+
 class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
-    """Test suite for Fundamental Agent (Gemini API) and prompt arbitration."""
+    """Test suite for Fundamental Agent (9Router OpenAI Gateway) and prompt arbitration."""
 
     def setUp(self) -> None:
         self.sample_payload_clean = {
@@ -83,23 +94,17 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[THE BULL THESIS (LONG SETUP)]", judge_prompt)
         self.assertIn("[THE BEAR THESIS (SHORT SETUP)]", judge_prompt)
 
-    @patch("src.agents.orchestrator.genai.GenerativeModel")
-    @patch("src.agents.orchestrator.AsyncAnthropic")
+    @patch("src.agents.orchestrator.client.chat.completions.create", new_callable=AsyncMock)
     async def test_async_orchestrator_clear_when_no_red_news(
         self,
-        mock_anthropic_cls: MagicMock,
-        mock_genai_cls: MagicMock,
+        mock_chat_create: AsyncMock,
     ) -> None:
-        """When no red news keywords are present, Gemini is NOT invoked and context is CLEAR."""
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
+        """When no red news keywords are present, Economist is NOT invoked and context is CLEAR."""
+        mock_resp_bull = _make_mock_completion("Bull thesis")
+        mock_resp_bear = _make_mock_completion("Bear thesis")
+        mock_resp_judge = _make_mock_completion('{"action": "BUY", "confidence": 85, "reasoning": "Valid Long"}')
 
-        mock_resp_bull = MagicMock(content=[MagicMock(text="Bull thesis")])
-        mock_resp_bear = MagicMock(content=[MagicMock(text="Bear thesis")])
-        mock_resp_judge = MagicMock(
-            content=[MagicMock(text='{"action": "BUY", "confidence": 85, "reasoning": "Valid Long"}')]
-        )
-        mock_client.messages.create = AsyncMock(side_effect=[mock_resp_bull, mock_resp_bear, mock_resp_judge])
+        mock_chat_create.side_effect = [mock_resp_bull, mock_resp_bear, mock_resp_judge]
 
         payload = TradingViewPayload(**self.sample_payload_clean)
         result = await run_multi_agent_analysis_async(
@@ -108,37 +113,27 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
             payload=payload,
         )
 
-        # Gemini should NOT be invoked
-        mock_genai_cls.assert_not_called()
+        # Chat completions called exactly 3 times (Bull, Bear, Judge)
+        self.assertEqual(mock_chat_create.call_count, 3)
+        self.assertEqual(mock_chat_create.call_args_list[0].kwargs["model"], "claude-3-5-sonnet-20241022")
+        self.assertEqual(mock_chat_create.call_args_list[1].kwargs["model"], "claude-3-5-sonnet-20241022")
+        self.assertEqual(mock_chat_create.call_args_list[2].kwargs["model"], "claude-3-5-sonnet-20241022")
 
         self.assertEqual(result["fundamental"], "CLEAR: No high-impact red news. Rely entirely on technicals.")
         self.assertEqual(result["judge"]["action"], "BUY")
 
-    @patch("src.agents.orchestrator.genai.GenerativeModel")
-    @patch("src.agents.orchestrator.AsyncAnthropic")
+    @patch("src.agents.orchestrator.client.chat.completions.create", new_callable=AsyncMock)
     async def test_async_orchestrator_invokes_gemini_on_red_news(
         self,
-        mock_anthropic_cls: MagicMock,
-        mock_genai_cls: MagicMock,
+        mock_chat_create: AsyncMock,
     ) -> None:
-        """When red news keywords (e.g. FOMC, CPI) are present, Gemini is invoked and passed to Judge."""
-        # Setup Gemini mock
-        mock_gemini_instance = MagicMock()
-        mock_genai_cls.return_value = mock_gemini_instance
-        mock_gemini_resp = MagicMock()
-        mock_gemini_resp.text = "DOVISH (Bullish for Gold/Crypto): Rate pause with dovish forward guidance."
-        mock_gemini_instance.generate_content_async = AsyncMock(return_value=mock_gemini_resp)
+        """When red news keywords (e.g. FOMC, CPI) are present, Economist is invoked via gemini-1.5-flash and passed to Judge."""
+        mock_resp_econ = _make_mock_completion("DOVISH (Bullish for Gold/Crypto): Rate pause with dovish forward guidance.")
+        mock_resp_bull = _make_mock_completion("Bull SMC analysis")
+        mock_resp_bear = _make_mock_completion("Bear SMC analysis")
+        mock_resp_judge = _make_mock_completion('{"action": "BUY", "confidence": 90, "reasoning": "Bullish tech + Dovish FOMC"}')
 
-        # Setup Anthropic mock
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
-
-        mock_resp_bull = MagicMock(content=[MagicMock(text="Bull SMC analysis")])
-        mock_resp_bear = MagicMock(content=[MagicMock(text="Bear SMC analysis")])
-        mock_resp_judge = MagicMock(
-            content=[MagicMock(text='{"action": "BUY", "confidence": 90, "reasoning": "Bullish tech + Dovish FOMC"}')]
-        )
-        mock_client.messages.create = AsyncMock(side_effect=[mock_resp_bull, mock_resp_bear, mock_resp_judge])
+        mock_chat_create.side_effect = [mock_resp_econ, mock_resp_bull, mock_resp_bear, mock_resp_judge]
 
         data_with_fomc = dict(self.sample_payload_clean, news_context="FOMC statement release at 2:00 PM EST")
         payload = TradingViewPayload(**data_with_fomc)
@@ -149,11 +144,12 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
             payload=payload,
         )
 
-        # Verify Gemini was invoked initially with gemini-1.5-flash-latest
-        mock_genai_cls.assert_called_with("gemini-1.5-flash-latest")
-        mock_gemini_instance.generate_content_async.assert_called_once()
-        called_prompt = mock_gemini_instance.generate_content_async.call_args[0][0]
-        self.assertIn("FOMC statement release", called_prompt)
+        # 4 total calls: Economist, Bull, Bear, Judge
+        self.assertEqual(mock_chat_create.call_count, 4)
+        first_call = mock_chat_create.call_args_list[0]
+        self.assertEqual(first_call.kwargs["model"], "gemini-1.5-flash")
+        called_user_content = first_call.kwargs["messages"][1]["content"]
+        self.assertIn("FOMC statement release", called_user_content)
 
         # Verify fundamental analysis was updated
         self.assertEqual(
@@ -163,33 +159,23 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["judge"]["action"], "BUY")
 
         # Verify Judge prompt received fundamental analysis
-        judge_call_kwargs = mock_client.messages.create.call_args_list[2].kwargs
-        judge_user_content = judge_call_kwargs["messages"][0]["content"]
+        judge_call = mock_chat_create.call_args_list[3]
+        judge_user_content = judge_call.kwargs["messages"][1]["content"]
         self.assertIn("[FUNDAMENTAL CONTEXT (MACRO / NEWS)]", judge_user_content)
         self.assertIn("DOVISH (Bullish for Gold/Crypto)", judge_user_content)
 
-    @patch("src.agents.orchestrator.genai.GenerativeModel")
-    @patch("src.agents.orchestrator.AsyncAnthropic")
+    @patch("src.agents.orchestrator.client.chat.completions.create", new_callable=AsyncMock)
     async def test_async_orchestrator_detects_keywords_in_market_data(
         self,
-        mock_anthropic_cls: MagicMock,
-        mock_genai_cls: MagicMock,
+        mock_chat_create: AsyncMock,
     ) -> None:
-        """When keyword like 'CPI' is directly in market_data string, Gemini is triggered even if payload is None."""
-        mock_gemini_instance = MagicMock()
-        mock_genai_cls.return_value = mock_gemini_instance
-        mock_gemini_resp = MagicMock()
-        mock_gemini_resp.text = "HAWKISH (Bearish for Gold/Crypto): Core CPI hot."
-        mock_gemini_instance.generate_content_async = AsyncMock(return_value=mock_gemini_resp)
+        """When keyword like 'CPI' is directly in market_data string, Economist is triggered even if payload is None."""
+        mock_resp_econ = _make_mock_completion("HAWKISH (Bearish for Gold/Crypto): Core CPI hot.")
+        mock_resp_bull = _make_mock_completion("Bull thesis")
+        mock_resp_bear = _make_mock_completion("Bear thesis")
+        mock_resp_judge = _make_mock_completion('{"action": "SELL", "confidence": 88, "reasoning": "Hawkish CPI + Bear OB"}')
 
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
-        mock_resp_bull = MagicMock(content=[MagicMock(text="Bull thesis")])
-        mock_resp_bear = MagicMock(content=[MagicMock(text="Bear thesis")])
-        mock_resp_judge = MagicMock(
-            content=[MagicMock(text='{"action": "SELL", "confidence": 88, "reasoning": "Hawkish CPI + Bear OB"}')]
-        )
-        mock_client.messages.create = AsyncMock(side_effect=[mock_resp_bull, mock_resp_bear, mock_resp_judge])
+        mock_chat_create.side_effect = [mock_resp_econ, mock_resp_bull, mock_resp_bear, mock_resp_judge]
 
         market_data_with_cpi = self.market_data_clean + "\nEvent: High impact Red News CPI print coming up"
         result = await run_multi_agent_analysis_async(
@@ -198,90 +184,28 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
             payload=None,
         )
 
-        mock_genai_cls.assert_called_with("gemini-1.5-flash-latest")
+        self.assertEqual(mock_chat_create.call_count, 4)
+        self.assertEqual(mock_chat_create.call_args_list[0].kwargs["model"], "gemini-1.5-flash")
         self.assertEqual(result["fundamental"], "HAWKISH (Bearish for Gold/Crypto): Core CPI hot.")
         self.assertEqual(result["judge"]["action"], "SELL")
 
-    @patch("src.agents.orchestrator.genai.GenerativeModel")
-    @patch("src.agents.orchestrator.AsyncAnthropic")
-    async def test_async_orchestrator_notfound_fallback(
+    @patch("src.agents.orchestrator.client.chat.completions.create", new_callable=AsyncMock)
+    async def test_async_orchestrator_router_error_fallback(
         self,
-        mock_anthropic_cls: MagicMock,
-        mock_genai_cls: MagicMock,
+        mock_chat_create: AsyncMock,
     ) -> None:
-        """When gemini-1.5-flash-latest raises NotFound (404), orchestrator falls back to gemini-pro / gemini-1.5-pro-latest."""
-        from google.api_core.exceptions import NotFound
+        """When Economist call fails on 9Router, fallback to 'NEUTRAL: Router Error' safely injected to Judge."""
+        mock_resp_bull = _make_mock_completion("Bull thesis")
+        mock_resp_bear = _make_mock_completion("Bear thesis")
+        mock_resp_judge = _make_mock_completion('{"action": "HOLD", "confidence": 50, "reasoning": "Relying on technicals"}')
 
-        # Setup mock behavior:
-        # 1st call for gemini-1.5-flash-latest raises NotFound
-        # 2nd call for gemini-pro succeeds
-        mock_primary = MagicMock()
-        mock_primary.generate_content_async = AsyncMock(
-            side_effect=NotFound("404 models/gemini-1.5-flash-latest is not found")
-        )
-
-        mock_fallback = MagicMock()
-        mock_fb_resp = MagicMock()
-        mock_fb_resp.text = "HAWKISH (Bearish for Gold/Crypto): Rate hike expectation."
-        mock_fallback.generate_content_async = AsyncMock(return_value=mock_fb_resp)
-
-        def _model_side_effect(name):
-            if name == "gemini-1.5-flash-latest":
-                return mock_primary
-            elif name == "gemini-pro":
-                return mock_fallback
-            return MagicMock()
-
-        mock_genai_cls.side_effect = _model_side_effect
-
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
-        mock_resp_bull = MagicMock(content=[MagicMock(text="Bull thesis")])
-        mock_resp_bear = MagicMock(content=[MagicMock(text="Bear thesis")])
-        mock_resp_judge = MagicMock(
-            content=[MagicMock(text='{"action": "SELL", "confidence": 80, "reasoning": "Fallback Hawkish"}')]
-        )
-        mock_client.messages.create = AsyncMock(side_effect=[mock_resp_bull, mock_resp_bear, mock_resp_judge])
-
-        data_with_news = dict(self.sample_payload_clean, news_context="Red News: NFP jobs report surging")
-        payload = TradingViewPayload(**data_with_news)
-
-        result = await run_multi_agent_analysis_async(
-            asset="BTCUSDT",
-            market_data=self.market_data_clean,
-            payload=payload,
-        )
-
-        # Verify fallback succeeded and updated fundamental analysis
-        self.assertEqual(result["fundamental"], "HAWKISH (Bearish for Gold/Crypto): Rate hike expectation.")
-
-        # Verify Judge received the fallback analysis
-        judge_call_kwargs = mock_client.messages.create.call_args_list[2].kwargs
-        judge_user_content = judge_call_kwargs["messages"][0]["content"]
-        self.assertIn("HAWKISH (Bearish for Gold/Crypto): Rate hike expectation.", judge_user_content)
-
-    @patch("src.agents.orchestrator.genai.GenerativeModel")
-    @patch("src.agents.orchestrator.AsyncAnthropic")
-    async def test_async_orchestrator_all_models_fail_safe_injection(
-        self,
-        mock_anthropic_cls: MagicMock,
-        mock_genai_cls: MagicMock,
-    ) -> None:
-        """When all models fail, NEUTRAL error message is safely injected into Judge prompt without crashing."""
-        from google.api_core.exceptions import NotFound
-
-        mock_failing = MagicMock()
-        mock_failing.generate_content_async = AsyncMock(side_effect=NotFound("Model not found"))
-        mock_genai_cls.return_value = mock_failing
-
-        mock_client = MagicMock()
-        mock_anthropic_cls.return_value = mock_client
-        mock_resp_bull = MagicMock(content=[MagicMock(text="Bull thesis")])
-        mock_resp_bear = MagicMock(content=[MagicMock(text="Bear thesis")])
-        mock_resp_judge = MagicMock(
-            content=[MagicMock(text='{"action": "HOLD", "confidence": 50, "reasoning": "Relying on technicals"}')]
-        )
-        mock_client.messages.create = AsyncMock(side_effect=[mock_resp_bull, mock_resp_bear, mock_resp_judge])
+        # First call (Economist) fails with an API error
+        mock_chat_create.side_effect = [
+            RuntimeError("502 Bad Gateway from 9Router"),
+            mock_resp_bull,
+            mock_resp_bear,
+            mock_resp_judge,
+        ]
 
         data_with_news = dict(self.sample_payload_clean, news_context="Red News: PPI inflation spikes")
         payload = TradingViewPayload(**data_with_news)
@@ -292,11 +216,11 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
             payload=payload,
         )
 
-        self.assertIn("NEUTRAL", result["fundamental"])
-        judge_call_kwargs = mock_client.messages.create.call_args_list[2].kwargs
-        judge_user_content = judge_call_kwargs["messages"][0]["content"]
+        self.assertEqual(result["fundamental"], "NEUTRAL: Router Error")
+        judge_call = mock_chat_create.call_args_list[3]
+        judge_user_content = judge_call.kwargs["messages"][1]["content"]
         self.assertIn("[FUNDAMENTAL CONTEXT (MACRO / NEWS)]", judge_user_content)
-        self.assertIn("NEUTRAL", judge_user_content)
+        self.assertIn("NEUTRAL: Router Error", judge_user_content)
 
 
 if __name__ == "__main__":

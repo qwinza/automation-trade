@@ -4,18 +4,22 @@ Orchestrates sequential reasoning between:
 1. The Bull (SMC Long specialist)
 2. The Bear (SMC Short specialist)
 3. The Judge (Chief Risk Manager enforcing RR >= 1:2)
+4. The Economist (Macro / Fundamental specialist for red news)
+
+All LLM calls are centralized through a single local API Gateway (9Router)
+using the OpenAI-compatible AsyncOpenAI client.
 """
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, Optional
 
-from anthropic import Anthropic, AsyncAnthropic
 from dotenv import load_dotenv
-from google.api_core.exceptions import NotFound
-import google.generativeai as genai
+from openai import AsyncOpenAI
 
 from src.agents.prompts import (
     BEAR_AGENT_PROMPT,
@@ -27,36 +31,15 @@ from src.agents.prompts import (
 # Load environment variables (.env has priority)
 load_dotenv(override=True)
 
-# Initialize Gemini API globally
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
 logger = logging.getLogger("hermes.agents.orchestrator")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-
-def _get_env_config() -> tuple[str, str, str]:
-    """Retrieve Anthropic client configuration from environment.
-
-    Returns:
-        tuple[api_key, base_url, model_name]
-    """
-    load_dotenv(override=True)
-    raw_api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or ""
-    # Strip URL or whitespace if accidentally included in api_key (e.g. https://.../sk-...)
-    api_key = raw_api_key.strip()
-    if "sk-" in api_key:
-        api_key = api_key[api_key.find("sk-"):]
-
-    raw_base_url = os.getenv("ANTHROPIC_BASE_URL") or "https://api.mwapi.dev"
-    base_url = raw_base_url.strip().rstrip("/")
-    # Anthropic SDK automatically appends /v1/messages.
-    # Strip trailing /v1 so we don't end up with /v1/v1/messages.
-    base_url = re.sub(r"/v1/?$", "", base_url)
-
-    model_name = os.getenv("MODEL_NAME", "claude-sonnet-5")
-
-    return api_key, base_url, model_name
+# Global 9Router client (OpenAI-compatible)
+client = AsyncOpenAI(
+    api_key=os.getenv("ROUTER_API_KEY") or "dummy-key",
+    base_url=os.getenv("ROUTER_BASE_URL", "http://139.190.97.252:20128/v1"),
+)
 
 
 def _clean_and_parse_json(raw_text: str) -> Dict[str, Any]:
@@ -164,17 +147,17 @@ def _extract_news_context(market_data: str, payload: Any = None) -> tuple[str, b
     return news_context, has_high_impact
 
 
-def run_multi_agent_analysis(
+async def run_multi_agent_analysis_async(
     asset: str,
     market_data: str,
     payload: Any = None,
 ) -> Dict[str, Any]:
-    """Execute synchronous multi-agent SMC & Fundamental analysis for a given asset.
+    """Execute asynchronous multi-agent SMC & Fundamental analysis for a given asset via 9Router.
 
     Workflow:
-    1. The Economist (Gemini) evaluates news event if high-impact news detected.
-    2. The Bull analyzes market_data for Long setups.
-    3. The Bear analyzes market_data for Short setups.
+    1. Fundamental Agent ("The Economist") evaluates news via 9Router (gemini-1.5-flash) if high-impact news detected.
+    2. The Bull analyzes market_data for Long setups via 9Router (claude-3-5-sonnet-20241022).
+    3. The Bear analyzes market_data for Short setups via 9Router (claude-3-5-sonnet-20241022).
     4. The Judge arbitrates Bull, Bear, and Fundamental Context against market_data with strict RR >= 1:2.
 
     Args:
@@ -185,193 +168,59 @@ def run_multi_agent_analysis(
     Returns:
         dict: Contains Bull analysis, Bear analysis, Fundamental analysis, and parsed Judge JSON decision.
     """
-    api_key, base_url, model_name = _get_env_config()
-
-    # Fundamental Agent evaluation
     fundamental_analysis = "CLEAR: No high-impact red news. Rely entirely on technicals."
     news_context, has_high_impact = _extract_news_context(market_data, payload)
 
+    # 1. Fundamental Agent (The Economist)
     if has_high_impact:
-        logger.info("High-impact red news detected. Invoking Fundamental Agent (Gemini)...")
+        logger.info("[Async] High-impact red news detected. Invoking Fundamental Agent via 9Router...")
         context_to_send = news_context if news_context and news_context != "None" else market_data
-        fundamental_prompt = f"{FUNDAMENTAL_AGENT_PROMPT}\n\nNews Event / Context:\n{context_to_send}"
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash-latest")
-            gemini_resp = model.generate_content(fundamental_prompt)
-            if gemini_resp and hasattr(gemini_resp, "text") and gemini_resp.text:
-                fundamental_analysis = gemini_resp.text.strip()
-            logger.info("Fundamental analysis result: %s", fundamental_analysis)
-        except (NotFound, Exception) as exc:
-            is_not_found = isinstance(exc, NotFound) or "not found" in str(exc).lower() or "404" in str(exc)
-            if is_not_found:
-                logger.warning("gemini-1.5-flash-latest returned NotFound: %s. Attempting fallback models...", exc)
-                fallback_models = ["gemini-pro", "gemini-1.5-pro-latest", "gemini-flash-latest"]
-                fallback_success = False
-                for fb_name in fallback_models:
-                    try:
-                        fb_model = genai.GenerativeModel(fb_name)
-                        fb_resp = fb_model.generate_content(fundamental_prompt)
-                        if fb_resp and hasattr(fb_resp, "text") and fb_resp.text:
-                            fundamental_analysis = fb_resp.text.strip()
-                            logger.info("Fallback model %s succeeded: %s", fb_name, fundamental_analysis)
-                            fallback_success = True
-                            break
-                    except Exception as fb_exc:
-                        logger.warning("Fallback model %s failed: %s", fb_name, fb_exc)
-                if not fallback_success:
-                    logger.error("All fallback models failed after NotFound: %s", exc)
-                    fundamental_analysis = f"NEUTRAL (Error: Gemini models not found - {exc})"
-            else:
-                logger.error("Failed to run Gemini fundamental analysis: %s", exc, exc_info=True)
-                fundamental_analysis = f"NEUTRAL (Error: {exc})"
-
-    logger.info("Initializing Anthropic client with base_url: %s, model: %s", base_url, model_name)
-    client = Anthropic(api_key=api_key, base_url=base_url)
-
-    # 1. Run The Bull
-    logger.info("Running The Bull agent for %s...", asset)
-    bull_user_msg = (
-        f"Asset: {asset}\n\nMarket Data:\n{market_data}\n\n"
-        "Evaluate this market data from an SMC Long perspective. Provide your full analysis."
-    )
-    bull_resp = client.messages.create(
-        model=model_name,
-        system=BULL_AGENT_PROMPT,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": bull_user_msg}],
-    )
-    bull_analysis = bull_resp.content[0].text if bull_resp.content else ""
-
-    # 2. Run The Bear
-    logger.info("Running The Bear agent for %s...", asset)
-    bear_user_msg = (
-        f"Asset: {asset}\n\nMarket Data:\n{market_data}\n\n"
-        "Evaluate this market data from an SMC Short perspective. Provide your full analysis."
-    )
-    bear_resp = client.messages.create(
-        model=model_name,
-        system=BEAR_AGENT_PROMPT,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": bear_user_msg}],
-    )
-    bear_analysis = bear_resp.content[0].text if bear_resp.content else ""
-
-    # 3. Run The Judge
-    logger.info("Running The Judge agent for %s...", asset)
-    judge_user_msg = _build_judge_prompt(
-        asset=asset,
-        market_data=market_data,
-        bull_thesis=bull_analysis,
-        bear_thesis=bear_analysis,
-        fundamental_context=fundamental_analysis,
-    )
-    judge_resp = client.messages.create(
-        model=model_name,
-        system=JUDGE_AGENT_PROMPT,
-        max_tokens=1000,
-        messages=[{"role": "user", "content": judge_user_msg}],
-    )
-    judge_raw = judge_resp.content[0].text if judge_resp.content else ""
-
-    judge_json = _clean_and_parse_json(judge_raw)
-
-    return {
-        "asset": asset,
-        "fundamental": fundamental_analysis,
-        "fundamental_analysis": fundamental_analysis,
-        "bull": bull_analysis,
-        "bear": bear_analysis,
-        "judge": judge_json,
-        "bull_analysis": bull_analysis,
-        "bear_analysis": bear_analysis,
-        "judge_decision": judge_json,
-        "raw_judge_response": judge_raw,
-    }
-
-
-async def run_multi_agent_analysis_async(
-    asset: str,
-    market_data: str,
-    payload: Any = None,
-) -> Dict[str, Any]:
-    """Execute asynchronous multi-agent SMC & Fundamental analysis for a given asset.
-
-    Workflow:
-    1. Fundamental Agent ("The Economist") evaluates news via Gemini API if high-impact news detected.
-    2. The Bull analyzes market_data for Long setups.
-    3. The Bear analyzes market_data for Short setups.
-    4. The Judge arbitrates Bull, Bear, and Fundamental Context against market_data with strict RR >= 1:2.
-    """
-    api_key, base_url, model_name = _get_env_config()
-
-    fundamental_analysis = "CLEAR: No high-impact red news. Rely entirely on technicals."
-    news_context, has_high_impact = _extract_news_context(market_data, payload)
-
-    if has_high_impact:
-        logger.info("[Async] High-impact red news detected. Invoking Fundamental Agent (Gemini)...")
-        context_to_send = news_context if news_context and news_context != "None" else market_data
-        fundamental_prompt = f"{FUNDAMENTAL_AGENT_PROMPT}\n\nNews Event / Context:\n{context_to_send}"
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash-latest")
-            gemini_resp = await model.generate_content_async(fundamental_prompt)
-            if gemini_resp and hasattr(gemini_resp, "text") and gemini_resp.text:
-                fundamental_analysis = gemini_resp.text.strip()
+            econ_resp = await client.chat.completions.create(
+                model="gemini-1.5-flash",
+                messages=[
+                    {"role": "system", "content": FUNDAMENTAL_AGENT_PROMPT},
+                    {"role": "user", "content": f"News Event / Context:\n{context_to_send}"},
+                ],
+            )
+            if econ_resp and econ_resp.choices and econ_resp.choices[0].message.content:
+                fundamental_analysis = econ_resp.choices[0].message.content.strip()
             logger.info("[Async] Fundamental analysis complete: %s", fundamental_analysis)
-        except (NotFound, Exception) as exc:
-            is_not_found = isinstance(exc, NotFound) or "not found" in str(exc).lower() or "404" in str(exc)
-            if is_not_found:
-                logger.warning("[Async] gemini-1.5-flash-latest returned NotFound: %s. Attempting fallback models...", exc)
-                fallback_models = ["gemini-pro", "gemini-1.5-pro-latest", "gemini-flash-latest"]
-                fallback_success = False
-                for fb_name in fallback_models:
-                    try:
-                        fb_model = genai.GenerativeModel(fb_name)
-                        fb_resp = await fb_model.generate_content_async(fundamental_prompt)
-                        if fb_resp and hasattr(fb_resp, "text") and fb_resp.text:
-                            fundamental_analysis = fb_resp.text.strip()
-                            logger.info("[Async] Fallback model %s succeeded: %s", fb_name, fundamental_analysis)
-                            fallback_success = True
-                            break
-                    except Exception as fb_exc:
-                        logger.warning("[Async] Fallback model %s failed: %s", fb_name, fb_exc)
-                if not fallback_success:
-                    logger.error("[Async] All fallback models failed after NotFound: %s", exc)
-                    fundamental_analysis = f"NEUTRAL (Error: Gemini models not found - {exc})"
-            else:
-                logger.error("[Async] Failed to run Gemini fundamental analysis: %s", exc, exc_info=True)
-                fundamental_analysis = f"NEUTRAL (Error: {exc})"
+        except Exception as exc:
+            logger.error("[Async] Failed to run fundamental analysis via 9Router: %s", exc, exc_info=True)
+            fundamental_analysis = "NEUTRAL: Router Error"
 
-    client = AsyncAnthropic(api_key=api_key, base_url=base_url)
-
-    # 1. Run The Bull
+    # 2. Run The Bull
     logger.info("[Async] Running The Bull agent for %s...", asset)
     bull_user_msg = (
         f"Asset: {asset}\n\nMarket Data:\n{market_data}\n\n"
         "Evaluate this market data from an SMC Long perspective. Provide your full analysis."
     )
-    bull_resp = await client.messages.create(
-        model=model_name,
-        system=BULL_AGENT_PROMPT,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": bull_user_msg}],
+    bull_resp = await client.chat.completions.create(
+        model="claude-3-5-sonnet-20241022",
+        messages=[
+            {"role": "system", "content": BULL_AGENT_PROMPT},
+            {"role": "user", "content": bull_user_msg},
+        ],
     )
-    bull_analysis = bull_resp.content[0].text if bull_resp.content else ""
+    bull_analysis = (bull_resp.choices[0].message.content or "").strip() if bull_resp and bull_resp.choices else ""
 
-    # 2. Run The Bear
+    # 3. Run The Bear
     logger.info("[Async] Running The Bear agent for %s...", asset)
     bear_user_msg = (
         f"Asset: {asset}\n\nMarket Data:\n{market_data}\n\n"
         "Evaluate this market data from an SMC Short perspective. Provide your full analysis."
     )
-    bear_resp = await client.messages.create(
-        model=model_name,
-        system=BEAR_AGENT_PROMPT,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": bear_user_msg}],
+    bear_resp = await client.chat.completions.create(
+        model="claude-3-5-sonnet-20241022",
+        messages=[
+            {"role": "system", "content": BEAR_AGENT_PROMPT},
+            {"role": "user", "content": bear_user_msg},
+        ],
     )
-    bear_analysis = bear_resp.content[0].text if bear_resp.content else ""
+    bear_analysis = (bear_resp.choices[0].message.content or "").strip() if bear_resp and bear_resp.choices else ""
 
-    # 3. Run The Judge
+    # 4. Run The Judge
     logger.info("[Async] Running The Judge agent for %s...", asset)
     judge_user_msg = _build_judge_prompt(
         asset=asset,
@@ -380,14 +229,14 @@ async def run_multi_agent_analysis_async(
         bear_thesis=bear_analysis,
         fundamental_context=fundamental_analysis,
     )
-    judge_resp = await client.messages.create(
-        model=model_name,
-        system=JUDGE_AGENT_PROMPT,
-        max_tokens=1000,
-        messages=[{"role": "user", "content": judge_user_msg}],
+    judge_resp = await client.chat.completions.create(
+        model="claude-3-5-sonnet-20241022",
+        messages=[
+            {"role": "system", "content": JUDGE_AGENT_PROMPT},
+            {"role": "user", "content": judge_user_msg},
+        ],
     )
-    judge_raw = judge_resp.content[0].text if judge_resp.content else ""
-
+    judge_raw = (judge_resp.choices[0].message.content or "").strip() if judge_resp and judge_resp.choices else ""
     judge_json = _clean_and_parse_json(judge_raw)
 
     return {
@@ -402,3 +251,21 @@ async def run_multi_agent_analysis_async(
         "judge_decision": judge_json,
         "raw_judge_response": judge_raw,
     }
+
+
+def run_multi_agent_analysis(
+    asset: str,
+    market_data: str,
+    payload: Any = None,
+) -> Dict[str, Any]:
+    """Execute synchronous multi-agent SMC & Fundamental analysis for a given asset."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, run_multi_agent_analysis_async(asset, market_data, payload)).result()
+    else:
+        return asyncio.run(run_multi_agent_analysis_async(asset, market_data, payload))
