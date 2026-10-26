@@ -115,9 +115,9 @@ class TestFundamentalAgent(unittest.IsolatedAsyncioTestCase):
 
         # Chat completions called exactly 3 times (Bull, Bear, Judge)
         self.assertEqual(mock_chat_create.call_count, 3)
-        self.assertEqual(mock_chat_create.call_args_list[0].kwargs["model"], "claude-3-5-sonnet-20241022")
-        self.assertEqual(mock_chat_create.call_args_list[1].kwargs["model"], "claude-3-5-sonnet-20241022")
-        self.assertEqual(mock_chat_create.call_args_list[2].kwargs["model"], "claude-3-5-sonnet-20241022")
+        self.assertEqual(mock_chat_create.call_args_list[0].kwargs["model"], "claude-sonnet-4-6")
+        self.assertEqual(mock_chat_create.call_args_list[1].kwargs["model"], "claude-sonnet-4-6")
+        self.assertEqual(mock_chat_create.call_args_list[2].kwargs["model"], "claude-sonnet-4-6")
 
         self.assertEqual(result["fundamental"], "CLEAR: No high-impact red news. Rely entirely on technicals.")
         self.assertEqual(result["judge"]["action"], "BUY")

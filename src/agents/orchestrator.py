@@ -156,8 +156,8 @@ async def run_multi_agent_analysis_async(
 
     Workflow:
     1. Fundamental Agent ("The Economist") evaluates news via 9Router (gemini-1.5-flash) if high-impact news detected.
-    2. The Bull analyzes market_data for Long setups via 9Router (claude-3-5-sonnet-20241022).
-    3. The Bear analyzes market_data for Short setups via 9Router (claude-3-5-sonnet-20241022).
+    2. The Bull analyzes market_data for Long setups via 9Router (claude-sonnet-4-6).
+    3. The Bear analyzes market_data for Short setups via 9Router (claude-sonnet-4-6).
     4. The Judge arbitrates Bull, Bear, and Fundamental Context against market_data with strict RR >= 1:2.
 
     Args:
@@ -197,7 +197,7 @@ async def run_multi_agent_analysis_async(
         "Evaluate this market data from an SMC Long perspective. Provide your full analysis."
     )
     bull_resp = await client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         messages=[
             {"role": "system", "content": BULL_AGENT_PROMPT},
             {"role": "user", "content": bull_user_msg},
@@ -212,7 +212,7 @@ async def run_multi_agent_analysis_async(
         "Evaluate this market data from an SMC Short perspective. Provide your full analysis."
     )
     bear_resp = await client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         messages=[
             {"role": "system", "content": BEAR_AGENT_PROMPT},
             {"role": "user", "content": bear_user_msg},
@@ -230,7 +230,7 @@ async def run_multi_agent_analysis_async(
         fundamental_context=fundamental_analysis,
     )
     judge_resp = await client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-6",
         messages=[
             {"role": "system", "content": JUDGE_AGENT_PROMPT},
             {"role": "user", "content": judge_user_msg},
